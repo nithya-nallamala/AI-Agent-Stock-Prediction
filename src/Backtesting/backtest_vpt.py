@@ -1,201 +1,262 @@
 #!/usr/bin/env python3
 import os
+# Force matplotlib to use a non-interactive backend for rendering in Streamlit
 os.environ['MPLBACKEND'] = 'Agg'
+
 import matplotlib
+# Use Agg backend explicitly
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
+# Ensure pyplot uses Agg
+plt.switch_backend("agg")
 
-import streamlit as st
-from datetime import datetime
-import logging
-import backtrader as bt
-import pandas as pd
-import sys
+import streamlit as st  # Streamlit for interactive UI
+from datetime import datetime  # For date handling
+import logging  # Standard logging library
+import backtrader as bt  # Backtesting framework
+import pandas as pd  # Data manipulation
+import sys  # For manipulating Python path
 
-# allow imports from project root
+# Add project source directory to path so custom modules can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from src.Data_Retrieval.data_fetcher import DataFetcher
-from src.UI.vpt import calculate_vpt
+# Custom modules
+from src.Data_Retrieval.data_fetcher import DataFetcher  # Historical data fetcher
+from src.Agents.VPT.vpt_agent import VPTAnalysisAgent  # AI-based decision agent
+import crewai  # CrewAI orchestration library
+from crewai import Task, Crew, Process  # Task and Crew abstractions
+from langchain_openai import ChatOpenAI  # LLM interface
 
-##############################################
-# VPT Indicator for Backtrader
-##############################################
+# ----------------------------------------
+# VPT calculation function
+# ----------------------------------------
+def calculate_vpt(df: pd.DataFrame,
+                  calc_period: int = 1,
+                  weighting_factor: float = 1.0,
+                  apply_smoothing: bool = False,
+                  smoothing_window: int = 1) -> pd.DataFrame:
+    """
+    Compute the Volume-Price Trend (VPT) indicator on a DataFrame.
+
+    - pct_change on 'close'
+    - multiply by volume and weighting_factor
+    - cumulative sum -> VPT
+    - optional rolling smoothing
+    """
+    df = df.copy()
+    # Standardize column names to lowercase
+    df.columns = [c.lower() for c in df.columns]
+
+    # Compute percentage change of closing price over 'calc_period' bars
+    df['price_change'] = df['close'].pct_change(periods=calc_period)
+
+    # Compute raw VPT and accumulate
+    df['vpt'] = (df['volume'] * df['price_change'] * weighting_factor).cumsum()
+
+    # Apply optional rolling smoothing
+    if apply_smoothing and smoothing_window > 1:
+        df['vpt'] = df['vpt'].rolling(window=int(smoothing_window), min_periods=1).mean()
+
+    return df
+
+# ----------------------------------------
+# VPT Indicator Wrapper for Backtrader
+# ----------------------------------------
 class VPTIndicatorBT(bt.Indicator):
+    """
+    Backtrader indicator that wraps the calculate_vpt logic.
+    Writes the VPT values into self.lines.vpt for each bar.
+    """
     lines = ('vpt',)
     params = (
-        ('calc_period',      1),
+        ('calc_period', 1),
         ('weighting_factor', 1.0),
-        ('apply_smoothing',  True),   # now smoothing on by default
-        ('smoothing_window', 5),      # 5‑day rolling VPT
+        ('apply_smoothing', False),
+        ('smoothing_window', 1),
     )
 
     def __init__(self):
-        self.addminperiod(self.p.calc_period + self.p.smoothing_window)
+        # Determine minimum required period before indicator fires
+        minp = self.p.calc_period + (self.p.smoothing_window - 1 if self.p.apply_smoothing else 0)
+        self.addminperiod(minp)
 
     def once(self, start, end):
+        # Called once after all historical data is loaded
         size = self.data.buflen()
+        # Build a small DataFrame from the internal data buffer
         df = pd.DataFrame({
-            'date':   [self.data.datetime.date(i) for i in range(size)],
+            'high':   [self.data.high[i]   for i in range(size)],
+            'low':    [self.data.low[i]    for i in range(size)],
             'close':  [self.data.close[i]  for i in range(size)],
             'volume': [self.data.volume[i] for i in range(size)],
-        }).set_index('date')
+        })
+        # Add a dummy date index (not used by VPT computation itself)
+        df['date'] = pd.date_range(end=datetime.today(), periods=size, freq='D')
 
-        df = calculate_vpt(
-            df.copy(),
+        # Calculate VPT using our pandas function
+        res = calculate_vpt(
+            df,
             calc_period=self.p.calc_period,
             weighting_factor=self.p.weighting_factor,
             apply_smoothing=self.p.apply_smoothing,
             smoothing_window=self.p.smoothing_window
         )
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            self.lines.vpt[i] = row['VPT']
+        # Write results back into the indicator line buffer
+        for i in range(size):
+            self.lines.vpt[i] = res['vpt'].iat[i]
 
-##############################################
-# Trend‑Filtered VPT Strategy
-##############################################
-class TrendFilteredVPTStrategy(bt.Strategy):
+# ----------------------------------------
+# VPT Strategy for Backtrader
+# ----------------------------------------
+class VPTStrategy(bt.Strategy):
+    """
+    Simple strategy: buy when VPT increases from previous bar, sell when it decreases.
+    Logs each trade in self.trade_log.
+    """
     params = (
-        ('calc_period',      1),
+        ('calc_period', 1),
         ('weighting_factor', 1.0),
-        ('apply_smoothing',  True),
-        ('smoothing_window', 5),
-        ('allocation',       1.0),
-        ('sma_period',       200),
+        ('apply_smoothing', False),
+        ('smoothing_window', 1),
+        ('allocation', 1.0),  # fraction of cash to allocate per trade
     )
 
     def __init__(self):
-        # 200‑day price filter
-        self.sma = bt.indicators.SimpleMovingAverage(self.data.close,
-                                                     period=self.p.sma_period)
-
-        # VPT momentum
-        self.vpt = VPTIndicatorBT(self.data,
-                                  calc_period=self.p.calc_period,
-                                  weighting_factor=self.p.weighting_factor,
-                                  apply_smoothing=self.p.apply_smoothing,
-                                  smoothing_window=self.p.smoothing_window)
-
         self.trade_log = []
+        # Attach the VPT indicator to the data feed
+        self.vpt_ind = VPTIndicatorBT(
+            self.data,
+            calc_period=self.p.calc_period,
+            weighting_factor=self.p.weighting_factor,
+            apply_smoothing=self.p.apply_smoothing,
+            smoothing_window=self.p.smoothing_window
+        )
 
     def next(self):
-        date  = self.datas[0].datetime.date(0)
-        price = self.data.close[0]
-        vpt_now, vpt_prev = self.vpt.vpt[0], self.vpt.vpt[-1]
-        above_trend = price > self.sma[0]
+        # Called on each new bar
+        dt       = self.datas[0].datetime.date(0)
+        close    = self.data.close[0]
+        vpt_now  = self.vpt_ind.vpt[0]
+        vpt_prev = self.vpt_ind.vpt[-1]
 
-        if not self.position:
-            # enter only if price above its 200‑day SMA & VPT momentum is positive
-            if above_trend and vpt_now > vpt_prev:
-                cash = self.broker.getcash()
-                size = int((cash * self.p.allocation) // price)
-                if size:
-                    self.buy(size=size)
-                    msg = f"{date}: BUY {size} @ {price:.2f}"
-                    self.trade_log.append(msg)
-                    logging.info(msg)
-        else:
-            # exit if VPT momentum turns negative or price falls below trend
-            if (vpt_now < vpt_prev) or not above_trend:
-                size = self.position.size
-                self.sell(size=size)
-                msg = f"{date}: SELL {size} @ {price:.2f}"
-                self.trade_log.append(msg)
-                logging.info(msg)
+        # Buy when momentum (VPT) turns positive
+        if not self.position and vpt_now > vpt_prev:
+            size = int((self.broker.getcash() * self.p.allocation) // close)
+            self.buy(size=size)
+            msg = f"{dt}: BUY  {size} @ {close:.2f}"
+            self.trade_log.append(msg)
+            logging.info(msg)
+        # Sell when momentum turns negative
+        elif self.position and vpt_now < vpt_prev:
+            size = self.position.size
+            self.sell(size=size)
+            msg = f"{dt}: SELL {size} @ {close:.2f}"
+            self.trade_log.append(msg)
+            logging.info(msg)
 
-##############################################
-# Backtest Runner
-##############################################
-def run_backtest(data_feed, cash, commission, **kw):
+# ----------------------------------------
+# Backtest runner
+# ----------------------------------------
+def run_backtest(strategy_class, data_feed, cash=10000, commission=0.001):
+    """
+    Set up Backtrader Cerebro engine, attach strategy and data, run, and return results.
+    """
     cerebro = bt.Cerebro()
-    cerebro.addstrategy(TrendFilteredVPTStrategy, **kw)
+    cerebro.addstrategy(strategy_class)
     cerebro.adddata(data_feed)
     cerebro.broker.setcash(cash)
     cerebro.broker.setcommission(commission)
-
+    # Attach analyzers
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.01)
     cerebro.addanalyzer(bt.analyzers.Returns,     _name='returns')
     cerebro.addanalyzer(bt.analyzers.DrawDown,    _name='drawdown')
 
-    logging.info("Running TrendFilteredVPTStrategy backtest…")
-    results = cerebro.run()
-    strat   = results[0]
+    logging.info(f"Running {strategy_class.__name__}…")
+    strat = cerebro.run()[0]
 
-    sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0)
-    rets   = strat.analyzers.returns.get_analysis()
-    dd     = strat.analyzers.drawdown.get_analysis()
-
-    perf = {
-        "Sharpe Ratio":         sharpe,
-        "Total Return":         rets.get('rtot', 0),
-        "Avg Daily Return":     rets.get('ravg', 0),
-        "Max Drawdown":         dd.get('drawdown', 0),
-        "Max Drawdown Duration": dd.get('maxdrawdownperiod', 'N/A'),
+    # Extract performance metrics
+    r = strat.analyzers.returns.get_analysis()
+    d = strat.analyzers.drawdown.get_analysis()
+    summary = {
+        "Sharpe Ratio":         strat.analyzers.sharpe.get_analysis().get('sharperatio', 0),
+        "Total Return (%)":     r.get('rtot', 0) * 100,
+        "Avg Daily Return (%)": r.get('ravg', 0) * 100,
+        "Max Drawdown (%)":     d.get('drawdown', 0) * 100,
     }
 
-    fig = cerebro.plot(iplot=False, show=False)[0][0]
-    return perf, strat.trade_log, fig
+    # Generate equity curve figure
+    fig = cerebro.plot(iplot=False)[0][0]
+    return summary, strat.trade_log, fig
 
-##############################################
-# Streamlit App
-##############################################
+# ----------------------------------------
+# Shared LLM for CrewAI (not explicitly used here)
+# ----------------------------------------
+gpt_llm = ChatOpenAI(model_name="gpt-4o", temperature=0.0, max_tokens=1500)
+
+# ----------------------------------------
+# Streamlit + CrewAI integration
+# ----------------------------------------
 def main():
-    st.title("VPT Backtest")
+    # Page title
+    st.title("VPT Backtest + CrewAI Signals")
 
+    # Sidebar inputs for parameters
     st.sidebar.header("Backtest Parameters")
-    ticker       = st.sidebar.text_input("Ticker",          value="SPY")
-    start         = st.sidebar.date_input("Start Date",    value=datetime(2020,1,1).date())
-    end           = st.sidebar.date_input("End Date",      value=datetime.today().date())
-    cash         = st.sidebar.number_input("Initial Cash",   value=10000)
-    commission   = st.sidebar.number_input("Commission",     value=0.001, step=0.0001)
+    ticker           = st.sidebar.text_input("Ticker", "AAPL")
+    sd               = st.sidebar.date_input("Start", datetime(2020, 1, 1).date())
+    ed               = st.sidebar.date_input("End",   datetime.today().date())
+    cash             = st.sidebar.number_input("Cash", 10000)
+    comm             = st.sidebar.number_input("Commission", 0.001, step=0.0001)
+    calc_period      = st.sidebar.number_input("VPT Calc Period", 1, step=1)
+    weighting_factor = st.sidebar.number_input("Weighting Factor", 1.0, step=0.1)
+    apply_smoothing  = st.sidebar.checkbox("Apply Smoothing", value=False)
+    smoothing_window = st.sidebar.number_input("Smoothing Window", 1, value=5, step=1) if apply_smoothing else 1
 
-    st.sidebar.markdown("---")
-    st.sidebar.header("VPT Settings")
-    cp    = st.sidebar.number_input("Calc Period",       min_value=1,   value=1)
-    wf    = st.sidebar.number_input("Weighting Factor",  min_value=0.0, value=1.0, step=0.1)
-    sm    = st.sidebar.checkbox("Smooth VPT",         value=True)
-    sw    = st.sidebar.number_input("Smoothing Window",  min_value=1, value=5) if sm else 1
-
-    st.sidebar.markdown("---")
-    st.sidebar.header("Trend & Strategy")
-    sma_p  = st.sidebar.number_input("Trend SMA Period",  min_value=50, value=200)
-    alloc  = st.sidebar.slider("Allocation Fraction", 0.0, 1.0, 1.0, step=0.1)
-
+    # Run button
     if st.sidebar.button("Run Backtest"):
-        st.write("Fetching data…")
-        df   = DataFetcher().get_stock_data(symbol=ticker, start_date=start, end_date=end)
-        feed = bt.feeds.PandasData(dataname=df, fromdate=start, todate=end)
+        # Fetch historical OHLCV data
+        df = DataFetcher().get_stock_data(symbol=ticker, start_date=sd, end_date=ed)
 
-        st.write("Running backtest…")
-        perf, trades, fig = run_backtest(
-            feed, cash, commission,
-            calc_period=cp,
-            weighting_factor=wf,
-            apply_smoothing=sm,
-            smoothing_window=sw,
-            sma_period=sma_p,
-            allocation=alloc
+        # Calculate VPT and rename for the agent
+        df_vpt = calculate_vpt(
+            df,
+            calc_period=calc_period,
+            weighting_factor=weighting_factor,
+            apply_smoothing=apply_smoothing,
+            smoothing_window=smoothing_window
         )
+        df_vpt.rename(columns={'vpt': 'VPT'}, inplace=True)
 
+        # Generate AI-based signal (logic retained but not displayed)
+        globals()['data'] = df_vpt.assign(date=df_vpt.index)
+        vpt_agent     = VPTAnalysisAgent()
+        advisor_agent = vpt_agent.vpt_trading_advisor()
+        current_price = df_vpt['close'].iloc[-1]
+        task          = vpt_agent.vpt_analysis(advisor_agent, globals()['data'], current_price)
+        crew          = Crew(agents=[advisor_agent], tasks=[task], verbose=True, process=Process.sequential)
+        _             = crew.kickoff()  # run AI signal generation silently
+
+        # Prepare Backtrader data feed from raw OHLCV
+        feed = bt.feeds.PandasData(dataname=df, fromdate=sd, todate=ed)
+
+        # Run the backtest and collect performance
+        perf, trades, fig = run_backtest(VPTStrategy, feed, cash=cash, commission=comm)
+
+        # Display performance summary
         st.subheader("Performance Summary")
-        st.write(f"**Sharpe Ratio:**      {perf['Sharpe Ratio']:.4f}")
-        st.write(f"**Total Return:**      {perf['Total Return']*100:.2f}%")
-        st.write(f"**Avg Daily Return:**  {perf['Avg Daily Return']*100:.2f}%")
-        st.write(f"**Max Drawdown:**      {perf['Max Drawdown']*100:.2f}%")
-        st.write(f"**Max Drawdown Duration:** {perf['Max Drawdown Duration']}")
+        st.write(perf)
 
+        # Display the executed trade log
         st.subheader("Trade Log")
-        if trades:
-            for t in trades:
-                st.write(t)
-        else:
-            st.write("No trades.")
+        for t in trades:
+            st.write(t)
 
+        # Render the equity curve chart
         st.subheader("Equity Curve")
         st.pyplot(fig)
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+if __name__ == '__main__':
+    # Enable logging when script runs
+    logging.basicConfig(level=logging.INFO)
     main()
